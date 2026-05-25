@@ -27,13 +27,23 @@ import { ComixFilter } from "./utils/filter";
 import { chapterListViaWebView, pageListViaWebView } from "./utils/webView";
 
 export class ComixInterceptor extends PaperbackInterceptor {
+  // Track original URLs for requests we rewrite, keyed by rewritten URL.
+  // Used as a fallback if the /i/ trick produces a 404 for newer chapters.
+  private rewriteMap = new Map<string, string>();
+
   override async interceptRequest(request: Request): Promise<Request> {
+    const rewritten = request.url.replace(
+      /(\/)si?i(\/[^/]+\/[^/]+\.(?:webp|jpe?g|png|gif|avif))(\?|$)/i,
+      "$1i$2$3",
+    );
+
+    if (rewritten !== request.url) {
+      this.rewriteMap.set(rewritten, request.url);
+    }
+
     return {
       ...request,
-      url: request.url.replace(
-        /(\/)si?i(\/[^/]+\/[^/]+\.(?:webp|jpe?g|png|gif|avif))(\?|$)/i,
-        "$1i$2$3",
-      ),
+      url: rewritten,
       headers: {
         ...request.headers,
         referer: `${DOMAIN}/`,
@@ -43,7 +53,7 @@ export class ComixInterceptor extends PaperbackInterceptor {
   }
 
   override async interceptResponse(
-    _: Request,
+    request: Request,
     response: Response,
     data: ArrayBuffer,
   ): Promise<ArrayBuffer> {
@@ -57,6 +67,35 @@ export class ComixInterceptor extends PaperbackInterceptor {
         },
       });
     }
+
+    // If the /i/ rewrite caused a 404, fall back to the original URL.
+    // Newer Comix chapters may be served from a different path that the
+    // rewrite breaks, while older chapters still need the rewrite.
+    if (response.status === 404) {
+      const originalUrl = this.rewriteMap.get(request.url);
+      if (originalUrl) {
+        this.rewriteMap.delete(request.url);
+        try {
+          const [fallbackResponse, fallbackData] = await Application.scheduleRequest({
+            url: originalUrl,
+            method: request.method ?? "GET",
+            headers: {
+              referer: `${DOMAIN}/`,
+              "user-agent": await Application.getDefaultUserAgent(),
+            },
+          });
+          if (fallbackResponse.status === 200) {
+            return fallbackData;
+          }
+        } catch {
+          // If the fallback also fails, fall through and return original data
+        }
+      }
+    } else {
+      // Clean up the map entry on success so it doesn't grow unboundedly
+      this.rewriteMap.delete(request.url);
+    }
+
     return data;
   }
 }
